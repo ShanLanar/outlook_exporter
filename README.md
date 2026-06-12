@@ -4,23 +4,26 @@
 
 ## Features
 
+✅ **Zwei Quellen** – Ganzer **Ordner** (inkl. Unterordner) **oder die aktuell in Outlook markierten Mails**  
 ✅ **Ordner-Dropdown** – Alle Outlook-Ordner (inkl. Pfade) in einer Auswahlliste  
-✅ **Unterordner-Support** – Rekursive Suche in Unterordnern (optional)  
 ✅ **Multi-Filter** – Nach Absender, Betreff, Text **und Empfangsdatum (von/bis)** gleichzeitig filtern  
 ✅ **Anhang-Filter** – Nur bestimmte Dateitypen (z.B. `pdf, xlsx`) und optional ohne Signatur-/Inline-Bilder  
 ✅ **Schnell bei großen Ordnern** – Absender/Betreff/Datum werden serverseitig (Outlook-DASL) vorgefiltert  
-✅ **Zwei Export-Modi:**
+✅ **Drei Export-Modi:**
   - **Anhänge**: Speichert alle Dateianhänge
-  - **Body**: Exportiert E-Mail-Inhalte als .txt-Dateien  
+  - **Body**: Exportiert E-Mail-Inhalte als `.txt`
+  - **Ganze Mail**: Speichert die komplette Mail als `.msg` (inkl. HTML/CC/Anhänge)  
+✅ **Inkrementell** – Exportierte Mails in Outlook als „Exportiert" markieren und beim nächsten Lauf überspringen  
+✅ **Ordnerstruktur spiegeln** – Optional die Quell-Ordnerstruktur im Zielverzeichnis nachbauen  
 ✅ **Intelligente Konfliktauflösung** – Identische Anhänge (per Inhalts-Hash) werden übersprungen, bei echten Unterschieden gewinnt die neuere Version  
-✅ **Abbrechen-Button** – Laufende Exporte lassen sich jederzeit stoppen  
+✅ **Fortschrittsbalken & Abbrechen** – Laufende Exporte sind sichtbar und jederzeit stoppbar  
 ✅ **CSV-Exportprotokoll** – Jeder Lauf schreibt `_export_protokoll_*.csv` mit allen verarbeiteten Elementen  
-✅ **Einstellungen gemerkt** – Ordner, Filter und Zielverzeichnis werden für den nächsten Start gespeichert  
-✅ **Detailliertes Logging** – Thread-sicher, Fortschritt und Status in Echtzeit  
+✅ **Einstellungen gemerkt** – Quelle, Filter und Optionen werden für den nächsten Start gespeichert  
+✅ **Detailliertes Logging** – Thread-sicher, farbig, in Echtzeit  
 
 ## Systemvoraussetzungen
 
-- **Windows** mit **Outlook 2010+** (muss laufen während des Exports)
+- **Windows** mit **Outlook 2010–2024 / Microsoft 365** (muss laufen während des Exports)
 - **Python 3.10+**
 - `pywin32` Paket
 

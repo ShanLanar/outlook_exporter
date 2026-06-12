@@ -102,6 +102,19 @@ def test_build_restrict_filter_escapes_quotes():
     assert "o''brien" in flt
 
 
+# ── has_category ──────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("categories, name, expected", [
+    ("Exportiert", "Exportiert", True),
+    ("Wichtig, Exportiert, Rot", "exportiert", True),   # case-insensitiv
+    ("Wichtig, Rot", "Exportiert", False),
+    ("", "Exportiert", False),
+    (None, "Exportiert", False),
+    ("Exportiert", "", False),
+])
+def test_has_category(categories, name, expected):
+    assert ox.has_category(categories, name) is expected
+
+
 # ── file_hash ─────────────────────────────────────────────────────────────────
 def test_file_hash_identical_content(tmp_path):
     a = tmp_path / "a.bin"

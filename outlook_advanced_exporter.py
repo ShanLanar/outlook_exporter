@@ -74,12 +74,17 @@ class ExportConfig:
     filter_sender: str
     filter_subject: str
     filter_body: str
-    export_type: str  # "attachments" | "body"
+    export_type: str  # "attachments" | "body" | "msg"
     output_dir: str
     filter_date_from: str = ""     # "TT.MM.JJJJ" oder "JJJJ-MM-TT"
     filter_date_to: str = ""
     filter_extensions: str = ""    # z.B. "pdf, xlsx" (leer = alle)
     skip_inline_images: bool = True
+    source: str = "folder"          # "folder" | "selection" (aktuelle Outlook-Auswahl)
+    mirror_structure: bool = False  # Quell-Ordnerstruktur im Zielordner nachbauen
+    mark_exported: bool = False     # exportierte Mails in Outlook kategorisieren
+    skip_marked: bool = False       # bereits markierte Mails überspringen
+    category_name: str = "Exportiert"
 
 
 @dataclass
@@ -169,6 +174,23 @@ def build_restrict_filter(sender: str, subject: str, dt_from, dt_to) -> str:
 
 # MAPI-Property: Content-ID → kennzeichnet inline eingebettete Bilder (Signaturen)
 _PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+
+
+def has_category(categories, name: str) -> bool:
+    """True, wenn ``name`` in der (kommagetrennten) Outlook-Kategorienliste steht."""
+    if not name:
+        return False
+    parts = [c.strip().lower() for c in str(categories or "").split(",")]
+    return name.strip().lower() in parts
+
+
+def add_category(mail, name: str) -> None:
+    """Hängt ``name`` an die Kategorien einer Mail an (idempotent) und speichert."""
+    if has_category(mail.Categories, name):
+        return
+    existing = str(mail.Categories or "").strip()
+    mail.Categories = f"{existing}, {name}" if existing else name
+    mail.Save()
 
 
 def is_inline_attachment(attachment) -> bool:
@@ -273,6 +295,8 @@ class ExportWorker(threading.Thread):
         self.q = msg_queue
         self.stop_event = stop_event
         self.records: list = []
+        self._total = 0
+        self._processed = 0
         # Filter einmalig vorparsen
         self._dt_from = parse_date(config.filter_date_from)
         self._dt_to = parse_date(config.filter_date_to, end_of_day=True)
@@ -290,32 +314,79 @@ class ExportWorker(threading.Thread):
 
     # -- intern ----------------------------------------------------------------
     def _export(self) -> int:
-        outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+        cfg = self.config
+        app = win32com.client.Dispatch("Outlook.Application")
+        app.GetNamespace("MAPI")
         log.info("✅ Mit Outlook verbunden.")
 
-        target_folder = None
-        for store in outlook.Folders:
-            target_folder = find_folder_by_path(store, self.config.folder_path)
-            if target_folder:
-                break
-        if not target_folder:
-            raise RuntimeError(f"Ordner '{self.config.folder_path}' nicht gefunden.")
-
-        log.info("📁 Verarbeite Ordner: %s (inkl. Unterordner: %s)",
-                 self.config.folder_path, self.config.include_subfolders)
-
-        out_dir = Path(self.config.output_dir)
+        out_dir = Path(cfg.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        count = self._process_folder(target_folder, self.config.include_subfolders, out_dir)
+        self._processed = 0
 
+        if cfg.source == "selection":
+            count = self._export_selection(app, out_dir)
+        else:
+            count = self._export_folder(app, out_dir)
+
+        self.q.put(("progress", (self._total, self._total)))
         if self.records:
             csv_path = write_export_csv(self.records, out_dir)
             log.info("🧾 Protokoll geschrieben: %s", csv_path.name)
         return count
 
+    def _export_selection(self, app, out_dir: Path) -> int:
+        try:
+            selection = app.ActiveExplorer().Selection
+            mails = [selection.Item(i) for i in range(1, selection.Count + 1)]
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"Keine aktive Outlook-Auswahl gefunden ({e}).")
+        self._total = len(mails)
+        log.info("✅ Verarbeite aktuelle Outlook-Auswahl: %d Element(e).", self._total)
+        count = 0
+        for mail in mails:
+            if self.stop_event.is_set():
+                break
+            self._tick()
+            count += self._process_mail(mail, out_dir)
+        return count
+
+    def _export_folder(self, app, out_dir: Path) -> int:
+        cfg = self.config
+        outlook = app.GetNamespace("MAPI")
+        target_folder = None
+        for store in outlook.Folders:
+            target_folder = find_folder_by_path(store, cfg.folder_path)
+            if target_folder:
+                break
+        if not target_folder:
+            raise RuntimeError(f"Ordner '{cfg.folder_path}' nicht gefunden.")
+
+        log.info("📁 Verarbeite Ordner: %s (inkl. Unterordner: %s)",
+                 cfg.folder_path, cfg.include_subfolders)
+        self._total = self._count_items(target_folder, cfg.include_subfolders)
+        return self._process_folder(target_folder, cfg.include_subfolders, out_dir)
+
+    def _count_items(self, folder, include_subfolders: bool) -> int:
+        """Obergrenze für den Fortschrittsbalken (zählt alle Elemente, ungefiltert)."""
+        total = 0
+        try:
+            total = folder.Items.Count
+            if include_subfolders:
+                for sub in folder.Folders:
+                    total += self._count_items(sub, True)
+        except Exception:  # noqa: BLE001
+            pass
+        return total
+
+    def _tick(self) -> None:
+        self._processed += 1
+        if self._processed <= 20 or self._processed % 10 == 0 or self._processed == self._total:
+            self.q.put(("progress", (self._processed, self._total)))
+
     def _process_folder(self, folder, include_subfolders: bool, out_dir: Path) -> int:
         count = 0
         cfg = self.config
+        out_dir.mkdir(parents=True, exist_ok=True)
         try:
             items = folder.Items
             # Absender/Betreff/Datum serverseitig vorfiltern (Performance)
@@ -331,38 +402,58 @@ class ExportWorker(threading.Thread):
             for mail in items:
                 if self.stop_event.is_set():
                     return count
-                if mail.Class != 43:  # nur E-Mails
-                    continue
-
-                # Clientseitige Filter (Sicherheitsnetz, auch ohne Restrict korrekt)
-                if not filter_matches(cfg.filter_sender, mail.SenderEmailAddress):
-                    continue
-                if not filter_matches(cfg.filter_subject, mail.Subject):
-                    continue
-                if not filter_matches(cfg.filter_body, mail.Body):
-                    continue
-                if self._dt_from or self._dt_to:
-                    rt = datetime.fromtimestamp(mail.ReceivedTime.timestamp())
-                    if not date_in_range(rt, self._dt_from, self._dt_to):
-                        continue
-
-                log.info("📧 %s - %s",
-                         mail.ReceivedTime.strftime("%Y-%m-%d %H:%M"), mail.Subject)
-
-                if cfg.export_type == "attachments":
-                    count += self._save_attachments(mail, out_dir)
-                elif cfg.export_type == "body":
-                    count += self._save_body(mail, out_dir)
+                self._tick()
+                count += self._process_mail(mail, out_dir)
 
             if include_subfolders:
                 for sub in folder.Folders:
                     if self.stop_event.is_set():
                         break
-                    count += self._process_folder(sub, True, out_dir)
+                    sub_out = out_dir / safe_filename(sub.Name) if cfg.mirror_structure else out_dir
+                    count += self._process_folder(sub, True, sub_out)
             return count
         except Exception as e:  # noqa: BLE001
             log.error("Fehler in %s: %s", folder.Name, e)
             return count
+
+    def _process_mail(self, mail, out_dir: Path) -> int:
+        """Filtert eine einzelne Mail und exportiert sie je nach Typ. Gibt die
+        Anzahl gespeicherter Elemente zurück (0 = übersprungen)."""
+        cfg = self.config
+        if mail.Class != 43:  # nur E-Mails
+            return 0
+        # Clientseitige Filter (Sicherheitsnetz, auch ohne Restrict korrekt)
+        if not filter_matches(cfg.filter_sender, mail.SenderEmailAddress):
+            return 0
+        if not filter_matches(cfg.filter_subject, mail.Subject):
+            return 0
+        if not filter_matches(cfg.filter_body, mail.Body):
+            return 0
+        if self._dt_from or self._dt_to:
+            rt = datetime.fromtimestamp(mail.ReceivedTime.timestamp())
+            if not date_in_range(rt, self._dt_from, self._dt_to):
+                return 0
+        if cfg.skip_marked and has_category(mail.Categories, cfg.category_name):
+            return 0
+
+        log.info("📧 %s - %s",
+                 mail.ReceivedTime.strftime("%Y-%m-%d %H:%M"), mail.Subject)
+
+        if cfg.export_type == "attachments":
+            saved = self._save_attachments(mail, out_dir)
+        elif cfg.export_type == "body":
+            saved = self._save_body(mail, out_dir)
+        elif cfg.export_type == "msg":
+            saved = self._save_msg(mail, out_dir)
+        else:
+            saved = 0
+
+        if saved and cfg.mark_exported:
+            try:
+                add_category(mail, cfg.category_name)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Kategorie konnte nicht gesetzt werden: %s", e)
+        return saved
 
     def _record(self, mail, kind, filename, status, note=""):
         self.records.append(ExportRecord(
@@ -436,6 +527,19 @@ class ExportWorker(threading.Thread):
         self._record(mail, "Body", filename, "Gespeichert")
         return 1
 
+    def _save_msg(self, mail, out_dir: Path) -> int:
+        timestamp = mail.ReceivedTime.strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp}_{safe_filename(mail.Subject)}.msg"
+        filepath = out_dir / filename
+        if filepath.exists():
+            log.info("   ⏭️  Übersprungen (existiert): %s", filename)
+            self._record(mail, "Mail", filename, "Übersprungen", "existiert bereits")
+            return 0
+        mail.SaveAs(str(filepath), 3)  # olMSG = 3 → komplette Mail inkl. HTML/Anhänge
+        log.info("   📧 Mail gespeichert: %s", filename)
+        self._record(mail, "Mail", filename, "Gespeichert")
+        return 1
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # GUI
@@ -470,25 +574,40 @@ class App(tk.Tk):
         mainframe = ttk.Frame(self, padding="10")
         mainframe.pack(fill=tk.BOTH, expand=True)
         mainframe.columnconfigure(0, weight=1)
-        mainframe.rowconfigure(10, weight=1)
+        r = 0
 
-        # 1. Ordnerauswahl
-        ttk.Label(mainframe, text="Outlook-Ordner:").grid(column=0, row=0, sticky=tk.W, pady=2)
+        # Quelle: Ordner oder aktuelle Outlook-Auswahl
+        src_frame = ttk.Frame(mainframe)
+        src_frame.grid(column=0, row=r, columnspan=2, sticky=tk.W, pady=(0, 4))
+        ttk.Label(src_frame, text="Quelle:").pack(side=tk.LEFT)
+        self.source_var = tk.StringVar(value="folder")
+        ttk.Radiobutton(src_frame, text="📁 Ordner", variable=self.source_var, value="folder",
+                        command=self._update_source_state).pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(src_frame, text="✅ Aktuelle Outlook-Auswahl", variable=self.source_var,
+                        value="selection", command=self._update_source_state).pack(side=tk.LEFT)
+        r += 1
+
+        # Ordnerauswahl
+        ttk.Label(mainframe, text="Outlook-Ordner:").grid(column=0, row=r, sticky=tk.W, pady=2)
+        r += 1
         self.folder_var = tk.StringVar()
         self.folder_combo = ttk.Combobox(mainframe, textvariable=self.folder_var,
                                           width=80, state="readonly")
-        self.folder_combo.grid(column=0, row=1, sticky=(tk.W, tk.E), pady=2)
-        ttk.Button(mainframe, text="Ordner neu laden",
-                   command=self._load_folders).grid(column=1, row=1, padx=5)
+        self.folder_combo.grid(column=0, row=r, sticky=(tk.W, tk.E), pady=2)
+        self.btn_reload = ttk.Button(mainframe, text="Ordner neu laden", command=self._load_folders)
+        self.btn_reload.grid(column=1, row=r, padx=5)
+        r += 1
 
-        # 2. Unterordner einschließen
         self.include_sub_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(mainframe, text="Unterordner einschließen",
-                        variable=self.include_sub_var).grid(column=0, row=2, sticky=tk.W, pady=5)
+        self.include_sub_check = ttk.Checkbutton(mainframe, text="Unterordner einschließen",
+                                                  variable=self.include_sub_var)
+        self.include_sub_check.grid(column=0, row=r, sticky=tk.W, pady=5)
+        r += 1
 
-        # 3. Filter
+        # Filter
         filter_frame = ttk.LabelFrame(mainframe, text="Filter (leer = alle)", padding="5")
-        filter_frame.grid(column=0, row=3, sticky=(tk.W, tk.E), pady=5)
+        filter_frame.grid(column=0, row=r, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        r += 1
         ttk.Label(filter_frame, text="Absender (enthält):").grid(column=0, row=0, sticky=tk.W)
         self.sender_entry = ttk.Entry(filter_frame, width=40)
         self.sender_entry.grid(column=1, row=0, sticky=tk.W, padx=5)
@@ -498,7 +617,6 @@ class App(tk.Tk):
         ttk.Label(filter_frame, text="Text (enthält):").grid(column=0, row=2, sticky=tk.W)
         self.body_entry = ttk.Entry(filter_frame, width=40)
         self.body_entry.grid(column=1, row=2, sticky=tk.W, padx=5)
-
         ttk.Label(filter_frame, text="Datum von (TT.MM.JJJJ):").grid(column=0, row=3, sticky=tk.W)
         self.date_from_entry = ttk.Entry(filter_frame, width=40)
         self.date_from_entry.grid(column=1, row=3, sticky=tk.W, padx=5)
@@ -509,50 +627,89 @@ class App(tk.Tk):
             column=0, row=5, sticky=tk.W)
         self.ext_entry = ttk.Entry(filter_frame, width=40)
         self.ext_entry.grid(column=1, row=5, sticky=tk.W, padx=5)
-
         self.skip_inline_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(filter_frame, text="Signatur-/Inline-Bilder überspringen",
                         variable=self.skip_inline_var).grid(column=0, row=6, columnspan=2,
                                                              sticky=tk.W, pady=(4, 0))
 
-        # 4. Export-Typ
-        ttk.Label(mainframe, text="Export-Typ:").grid(column=0, row=4, sticky=tk.W, pady=5)
+        # Export-Typ
+        ttk.Label(mainframe, text="Export-Typ:").grid(column=0, row=r, sticky=tk.W, pady=(5, 0))
+        r += 1
+        type_frame = ttk.Frame(mainframe)
+        type_frame.grid(column=0, row=r, columnspan=2, sticky=tk.W)
+        r += 1
         self.export_var = tk.StringVar(value="attachments")
-        ttk.Radiobutton(mainframe, text="📎 Nur Anhänge", variable=self.export_var,
-                        value="attachments").grid(column=0, row=5, sticky=tk.W)
-        ttk.Radiobutton(mainframe, text="📄 Nur E-Mail-Body (als .txt)", variable=self.export_var,
-                        value="body").grid(column=0, row=6, sticky=tk.W)
+        ttk.Radiobutton(type_frame, text="📎 Anhänge", variable=self.export_var,
+                        value="attachments").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Radiobutton(type_frame, text="📄 Body (.txt)", variable=self.export_var,
+                        value="body").pack(side=tk.LEFT, padx=8)
+        ttk.Radiobutton(type_frame, text="📧 Ganze Mail (.msg)", variable=self.export_var,
+                        value="msg").pack(side=tk.LEFT, padx=8)
 
-        # 5. Ausgabeverzeichnis
-        ttk.Label(mainframe, text="Ausgabeverzeichnis:").grid(column=0, row=7, sticky=tk.W, pady=5)
+        # Optionen
+        opt_frame = ttk.Frame(mainframe)
+        opt_frame.grid(column=0, row=r, columnspan=2, sticky=tk.W, pady=(2, 4))
+        r += 1
+        self.mirror_var = tk.BooleanVar(value=False)
+        self.mirror_check = ttk.Checkbutton(opt_frame, text="Ordnerstruktur im Ziel nachbauen",
+                                            variable=self.mirror_var)
+        self.mirror_check.grid(column=0, row=0, sticky=tk.W)
+        self.mark_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt_frame, text="Exportierte Mails in Outlook als 'Exportiert' markieren",
+                        variable=self.mark_var).grid(column=0, row=1, sticky=tk.W)
+        self.skip_marked_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opt_frame, text="Bereits markierte Mails überspringen",
+                        variable=self.skip_marked_var).grid(column=0, row=2, sticky=tk.W)
+
+        # Ausgabeverzeichnis
+        ttk.Label(mainframe, text="Ausgabeverzeichnis:").grid(column=0, row=r, sticky=tk.W, pady=5)
+        r += 1
         output_frame = ttk.Frame(mainframe)
-        output_frame.grid(column=0, row=8, sticky=(tk.W, tk.E))
+        output_frame.grid(column=0, row=r, columnspan=2, sticky=(tk.W, tk.E))
+        r += 1
         self.output_entry = ttk.Entry(output_frame, width=70)
         self.output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(output_frame, text="Durchsuchen...",
                    command=self._select_output).pack(side=tk.RIGHT, padx=5)
 
-        # 6. Log
-        ttk.Label(mainframe, text="Log:").grid(column=0, row=9, sticky=tk.W, pady=5)
-        self.log_widget = scrolledtext.ScrolledText(mainframe, height=18, state=tk.NORMAL)
-        self.log_widget.grid(column=0, row=10, columnspan=2,
-                             sticky=(tk.N, tk.S, tk.E, tk.W), pady=5)
+        # Fortschrittsbalken
+        self.progress_bar = ttk.Progressbar(mainframe, mode="determinate")
+        self.progress_bar.grid(column=0, row=r, columnspan=2, sticky=(tk.W, tk.E), pady=(6, 0))
+        r += 1
+
+        # Log
+        ttk.Label(mainframe, text="Log:").grid(column=0, row=r, sticky=tk.W, pady=5)
+        r += 1
+        self.log_widget = scrolledtext.ScrolledText(mainframe, height=14, state=tk.NORMAL)
+        self.log_widget.grid(column=0, row=r, columnspan=2, sticky=(tk.N, tk.S, tk.E, tk.W), pady=5)
+        mainframe.rowconfigure(r, weight=1)
+        r += 1
         # Farbliche Kategorien für die Log-Ausgabe
         self.log_widget.tag_config("error", foreground="#c0392b")
         self.log_widget.tag_config("warning", foreground="#d35400")
         self.log_widget.tag_config("success", foreground="#1e8449")
         self.log_widget.tag_config("muted", foreground="#7f8c8d")
         self.progress_label = ttk.Label(mainframe, text="Bereit.")
-        self.progress_label.grid(column=0, row=11, sticky=tk.W, pady=5)
+        self.progress_label.grid(column=0, row=r, sticky=tk.W, pady=5)
+        r += 1
 
-        # 7. Buttons
+        # Buttons
         btn_frame = ttk.Frame(mainframe)
-        btn_frame.grid(column=0, row=12, columnspan=2, pady=10)
+        btn_frame.grid(column=0, row=r, columnspan=2, pady=10)
         self.btn_start = ttk.Button(btn_frame, text="🚀 Export starten", command=self._on_start)
         self.btn_start.pack(side=tk.LEFT, padx=5)
         self.btn_stop = ttk.Button(btn_frame, text="⏹ Abbrechen",
                                    command=self._on_stop, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=5)
+
+    def _update_source_state(self) -> None:
+        """Aktiviert/deaktiviert ordnerbezogene Felder je nach Quelle."""
+        folder_mode = self.source_var.get() == "folder"
+        state = tk.NORMAL if folder_mode else tk.DISABLED
+        self.folder_combo.config(state="readonly" if folder_mode else tk.DISABLED)
+        self.btn_reload.config(state=state)
+        self.include_sub_check.config(state=state)
+        self.mirror_check.config(state=state)
 
     # -- Aktionen --------------------------------------------------------------
     def _load_folders(self) -> None:
@@ -574,7 +731,8 @@ class App(tk.Tk):
             self.output_entry.insert(0, d)
 
     def _on_start(self) -> None:
-        if not self.folder_var.get():
+        source = self.source_var.get()
+        if source == "folder" and not self.folder_var.get():
             messagebox.showwarning("Fehler", "Bitte wählen Sie einen Ordner aus.")
             return
         if not self.output_entry.get():
@@ -601,10 +759,15 @@ class App(tk.Tk):
             filter_date_to=self.date_to_entry.get(),
             filter_extensions=self.ext_entry.get(),
             skip_inline_images=self.skip_inline_var.get(),
+            source=source,
+            mirror_structure=self.mirror_var.get(),
+            mark_exported=self.mark_var.get(),
+            skip_marked=self.skip_marked_var.get(),
         )
         self._save_settings()
 
         self.log_widget.delete(1.0, tk.END)
+        self.progress_bar.config(value=0)
         self.progress_label.config(text="Export läuft...")
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
@@ -626,6 +789,9 @@ class App(tk.Tk):
                 if kind == "log":
                     msg, level = payload
                     self._append_log(msg, level)
+                elif kind == "progress":
+                    current, total = payload
+                    self.progress_bar.config(maximum=max(total, 1), value=current)
                 elif kind == "done":
                     self._finish(f"✨ Fertig! {payload} Elemente exportiert.",
                                  "Erfolg", f"Export beendet.\n{payload} Elemente gespeichert.")
@@ -677,6 +843,11 @@ class App(tk.Tk):
         self.date_to_entry.insert(0, s.get("filter_date_to", ""))
         self.ext_entry.insert(0, s.get("filter_extensions", ""))
         self.skip_inline_var.set(s.get("skip_inline_images", True))
+        self.source_var.set(s.get("source", "folder"))
+        self.mirror_var.set(s.get("mirror_structure", False))
+        self.mark_var.set(s.get("mark_exported", False))
+        self.skip_marked_var.set(s.get("skip_marked", False))
+        self._update_source_state()
 
     def _save_settings(self) -> None:
         save_settings({
@@ -691,6 +862,10 @@ class App(tk.Tk):
             "filter_date_to": self.date_to_entry.get(),
             "filter_extensions": self.ext_entry.get(),
             "skip_inline_images": self.skip_inline_var.get(),
+            "source": self.source_var.get(),
+            "mirror_structure": self.mirror_var.get(),
+            "mark_exported": self.mark_var.get(),
+            "skip_marked": self.skip_marked_var.get(),
         })
 
     def _on_close(self) -> None:
