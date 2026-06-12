@@ -3,6 +3,7 @@
 Ausführen:  pytest    (benötigt weder Windows noch Outlook)
 """
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,67 @@ def test_safe_filename_handles_non_str():
 ])
 def test_filter_matches(needle, haystack, expected):
     assert ox.filter_matches(needle, haystack) is expected
+
+
+# ── Datums-Filter ─────────────────────────────────────────────────────────────
+def test_parse_date_formats():
+    assert ox.parse_date("15.03.2024") == datetime(2024, 3, 15)
+    assert ox.parse_date("2024-03-15") == datetime(2024, 3, 15)
+
+
+def test_parse_date_end_of_day():
+    assert ox.parse_date("15.03.2024", end_of_day=True) == datetime(2024, 3, 15, 23, 59, 59)
+
+
+def test_parse_date_invalid_and_empty():
+    assert ox.parse_date("") is None
+    assert ox.parse_date("kein datum") is None
+    assert ox.parse_date("32.13.2024") is None
+
+
+def test_date_in_range():
+    start, end = datetime(2024, 1, 1), datetime(2024, 12, 31)
+    assert ox.date_in_range(datetime(2024, 6, 1), start, end) is True
+    assert ox.date_in_range(datetime(2023, 6, 1), start, end) is False
+    assert ox.date_in_range(datetime(2025, 6, 1), start, end) is False
+    assert ox.date_in_range(datetime(2030, 1, 1), None, None) is True
+
+
+# ── Endungs-Filter ────────────────────────────────────────────────────────────
+def test_parse_extensions():
+    assert ox.parse_extensions("pdf, .XLSX ,, docx") == {"pdf", "xlsx", "docx"}
+    assert ox.parse_extensions("") == set()
+
+
+@pytest.mark.parametrize("name, allowed, expected", [
+    ("rechnung.pdf", {"pdf"}, True),
+    ("rechnung.PDF", {"pdf"}, True),
+    ("bild.png", {"pdf", "xlsx"}, False),
+    ("ohneendung", {"pdf"}, False),
+    ("egal.xyz", set(), True),          # kein Filter ⇒ alles erlaubt
+])
+def test_extension_allowed(name, allowed, expected):
+    assert ox.extension_allowed(name, allowed) is expected
+
+
+# ── DASL-Restrict-Filter ──────────────────────────────────────────────────────
+def test_build_restrict_filter_empty():
+    assert ox.build_restrict_filter("", "", None, None) == ""
+
+
+def test_build_restrict_filter_combines():
+    flt = ox.build_restrict_filter("@firma.de", "Rechnung", datetime(2024, 1, 1), None)
+    assert flt.startswith("@SQL=")
+    assert "urn:schemas:httpmail:fromemail" in flt
+    assert "%@firma.de%" in flt
+    assert "urn:schemas:httpmail:subject" in flt
+    assert "datereceived" in flt
+    assert " AND " in flt
+
+
+def test_build_restrict_filter_escapes_quotes():
+    flt = ox.build_restrict_filter("o'brien", "", None, None)
+    assert "o''brien" in flt
 
 
 # ── file_hash ─────────────────────────────────────────────────────────────────

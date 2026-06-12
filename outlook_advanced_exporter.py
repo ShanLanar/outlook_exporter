@@ -76,6 +76,10 @@ class ExportConfig:
     filter_body: str
     export_type: str  # "attachments" | "body"
     output_dir: str
+    filter_date_from: str = ""     # "TT.MM.JJJJ" oder "JJJJ-MM-TT"
+    filter_date_to: str = ""
+    filter_extensions: str = ""    # z.B. "pdf, xlsx" (leer = alle)
+    skip_inline_images: bool = True
 
 
 @dataclass
@@ -102,6 +106,77 @@ def safe_filename(name: str) -> str:
 def filter_matches(needle: str, haystack) -> bool:
     """True, wenn der Filter leer ist oder als Teilstring (case-insensitiv) passt."""
     return not needle or needle.lower() in str(haystack).lower()
+
+
+def parse_date(text: str, end_of_day: bool = False):
+    """Parst ``TT.MM.JJJJ`` oder ``JJJJ-MM-TT`` zu ``datetime``. Leerer/ungültiger
+    Text ergibt ``None``. Bei ``end_of_day`` zählt der ganze Tag bis 23:59:59."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(text, fmt)
+            return dt.replace(hour=23, minute=59, second=59) if end_of_day else dt
+        except ValueError:
+            continue
+    return None
+
+
+def date_in_range(dt: datetime, start, end) -> bool:
+    """True, wenn ``dt`` innerhalb [start, end] liegt (Grenzen optional)."""
+    if start and dt < start:
+        return False
+    if end and dt > end:
+        return False
+    return True
+
+
+def parse_extensions(raw: str) -> set:
+    """``"pdf, .xlsx"`` → ``{"pdf", "xlsx"}`` (klein, ohne Punkt)."""
+    return {e.strip().lower().lstrip(".") for e in (raw or "").split(",") if e.strip()}
+
+
+def extension_allowed(filename: str, allowed: set) -> bool:
+    """True, wenn keine Endungen vorgegeben sind oder die Datei passt."""
+    if not allowed:
+        return True
+    if "." not in filename:
+        return False
+    return filename.rsplit(".", 1)[-1].lower() in allowed
+
+
+def build_restrict_filter(sender: str, subject: str, dt_from, dt_to) -> str:
+    """Baut einen Outlook-DASL-``@SQL``-Filter (oder "" wenn nichts zu filtern).
+
+    Damit lassen sich Absender/Betreff/Datum serverseitig vorfiltern, statt jede
+    Mail einzeln zu prüfen. Die clientseitigen Checks bleiben als Sicherheitsnetz.
+    """
+    def esc(s: str) -> str:
+        return s.replace("'", "''")
+
+    clauses = []
+    if sender:
+        clauses.append(f"\"urn:schemas:httpmail:fromemail\" LIKE '%{esc(sender)}%'")
+    if subject:
+        clauses.append(f"\"urn:schemas:httpmail:subject\" LIKE '%{esc(subject)}%'")
+    if dt_from:
+        clauses.append(f"\"urn:schemas:httpmail:datereceived\" >= '{dt_from:%m/%d/%Y %H:%M}'")
+    if dt_to:
+        clauses.append(f"\"urn:schemas:httpmail:datereceived\" <= '{dt_to:%m/%d/%Y %H:%M}'")
+    return "@SQL=" + " AND ".join(clauses) if clauses else ""
+
+
+# MAPI-Property: Content-ID → kennzeichnet inline eingebettete Bilder (Signaturen)
+_PR_ATTACH_CONTENT_ID = "http://schemas.microsoft.com/mapi/proptag/0x3712001F"
+
+
+def is_inline_attachment(attachment) -> bool:
+    """True, wenn der Anhang eine Content-ID hat (inline im HTML, z.B. Signaturlogo)."""
+    try:
+        return bool(attachment.PropertyAccessor.GetProperty(_PR_ATTACH_CONTENT_ID))
+    except Exception:  # noqa: BLE001 – Property fehlt ⇒ kein Inline-Bild
+        return False
 
 
 def file_hash(path: Path, chunk: int = 65536) -> str:
@@ -198,6 +273,10 @@ class ExportWorker(threading.Thread):
         self.q = msg_queue
         self.stop_event = stop_event
         self.records: list = []
+        # Filter einmalig vorparsen
+        self._dt_from = parse_date(config.filter_date_from)
+        self._dt_to = parse_date(config.filter_date_to, end_of_day=True)
+        self._exts = parse_extensions(config.filter_extensions)
 
     def run(self) -> None:
         try:
@@ -239,6 +318,14 @@ class ExportWorker(threading.Thread):
         cfg = self.config
         try:
             items = folder.Items
+            # Absender/Betreff/Datum serverseitig vorfiltern (Performance)
+            restrict = build_restrict_filter(cfg.filter_sender, cfg.filter_subject,
+                                             self._dt_from, self._dt_to)
+            if restrict:
+                try:
+                    items = items.Restrict(restrict)
+                except Exception as e:  # noqa: BLE001 – Fallback auf volle Suche
+                    log.warning("Restrict-Filter nicht angewendet (%s) – volle Suche.", e)
             items.Sort("[ReceivedTime]", True)
 
             for mail in items:
@@ -247,13 +334,17 @@ class ExportWorker(threading.Thread):
                 if mail.Class != 43:  # nur E-Mails
                     continue
 
-                # Filter anwenden (Teilstring, case-insensitive)
+                # Clientseitige Filter (Sicherheitsnetz, auch ohne Restrict korrekt)
                 if not filter_matches(cfg.filter_sender, mail.SenderEmailAddress):
                     continue
                 if not filter_matches(cfg.filter_subject, mail.Subject):
                     continue
                 if not filter_matches(cfg.filter_body, mail.Body):
                     continue
+                if self._dt_from or self._dt_to:
+                    rt = datetime.fromtimestamp(mail.ReceivedTime.timestamp())
+                    if not date_in_range(rt, self._dt_from, self._dt_to):
+                        continue
 
                 log.info("📧 %s - %s",
                          mail.ReceivedTime.strftime("%Y-%m-%d %H:%M"), mail.Subject)
@@ -283,7 +374,14 @@ class ExportWorker(threading.Thread):
 
     def _save_attachments(self, mail, out_dir: Path) -> int:
         saved = 0
+        cfg = self.config
         for attachment in mail.Attachments:
+            # Signatur-/Inline-Bilder und unerwünschte Dateitypen still überspringen
+            if cfg.skip_inline_images and is_inline_attachment(attachment):
+                continue
+            if not extension_allowed(str(attachment.FileName), self._exts):
+                continue
+
             safe_name = safe_filename(attachment.FileName)
             target_path = out_dir / safe_name
 
@@ -401,6 +499,22 @@ class App(tk.Tk):
         self.body_entry = ttk.Entry(filter_frame, width=40)
         self.body_entry.grid(column=1, row=2, sticky=tk.W, padx=5)
 
+        ttk.Label(filter_frame, text="Datum von (TT.MM.JJJJ):").grid(column=0, row=3, sticky=tk.W)
+        self.date_from_entry = ttk.Entry(filter_frame, width=40)
+        self.date_from_entry.grid(column=1, row=3, sticky=tk.W, padx=5)
+        ttk.Label(filter_frame, text="Datum bis (TT.MM.JJJJ):").grid(column=0, row=4, sticky=tk.W)
+        self.date_to_entry = ttk.Entry(filter_frame, width=40)
+        self.date_to_entry.grid(column=1, row=4, sticky=tk.W, padx=5)
+        ttk.Label(filter_frame, text="Nur Dateitypen (z.B. pdf, xlsx):").grid(
+            column=0, row=5, sticky=tk.W)
+        self.ext_entry = ttk.Entry(filter_frame, width=40)
+        self.ext_entry.grid(column=1, row=5, sticky=tk.W, padx=5)
+
+        self.skip_inline_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(filter_frame, text="Signatur-/Inline-Bilder überspringen",
+                        variable=self.skip_inline_var).grid(column=0, row=6, columnspan=2,
+                                                             sticky=tk.W, pady=(4, 0))
+
         # 4. Export-Typ
         ttk.Label(mainframe, text="Export-Typ:").grid(column=0, row=4, sticky=tk.W, pady=5)
         self.export_var = tk.StringVar(value="attachments")
@@ -467,6 +581,14 @@ class App(tk.Tk):
             messagebox.showwarning("Fehler", "Bitte wählen Sie ein Ausgabeverzeichnis.")
             return
 
+        # Datumseingaben validieren (leer ist erlaubt)
+        for label, value in (("Datum von", self.date_from_entry.get()),
+                             ("Datum bis", self.date_to_entry.get())):
+            if value.strip() and parse_date(value) is None:
+                messagebox.showwarning(
+                    "Fehler", f"'{label}' ist kein gültiges Datum (TT.MM.JJJJ).")
+                return
+
         config = ExportConfig(
             folder_path=self.folder_var.get(),
             include_subfolders=self.include_sub_var.get(),
@@ -475,6 +597,10 @@ class App(tk.Tk):
             filter_body=self.body_entry.get(),
             export_type=self.export_var.get(),
             output_dir=self.output_entry.get(),
+            filter_date_from=self.date_from_entry.get(),
+            filter_date_to=self.date_to_entry.get(),
+            filter_extensions=self.ext_entry.get(),
+            skip_inline_images=self.skip_inline_var.get(),
         )
         self._save_settings()
 
@@ -547,6 +673,10 @@ class App(tk.Tk):
         self.body_entry.insert(0, s.get("filter_body", ""))
         self.export_var.set(s.get("export_type", "attachments"))
         self.output_entry.insert(0, s.get("output_dir", ""))
+        self.date_from_entry.insert(0, s.get("filter_date_from", ""))
+        self.date_to_entry.insert(0, s.get("filter_date_to", ""))
+        self.ext_entry.insert(0, s.get("filter_extensions", ""))
+        self.skip_inline_var.set(s.get("skip_inline_images", True))
 
     def _save_settings(self) -> None:
         save_settings({
@@ -557,6 +687,10 @@ class App(tk.Tk):
             "filter_body": self.body_entry.get(),
             "export_type": self.export_var.get(),
             "output_dir": self.output_entry.get(),
+            "filter_date_from": self.date_from_entry.get(),
+            "filter_date_to": self.date_to_entry.get(),
+            "filter_extensions": self.ext_entry.get(),
+            "skip_inline_images": self.skip_inline_var.get(),
         })
 
     def _on_close(self) -> None:

@@ -6,7 +6,9 @@
 
 ✅ **Ordner-Dropdown** – Alle Outlook-Ordner (inkl. Pfade) in einer Auswahlliste  
 ✅ **Unterordner-Support** – Rekursive Suche in Unterordnern (optional)  
-✅ **Multi-Filter** – Nach Absender, Betreff und Text gleichzeitig filtern  
+✅ **Multi-Filter** – Nach Absender, Betreff, Text **und Empfangsdatum (von/bis)** gleichzeitig filtern  
+✅ **Anhang-Filter** – Nur bestimmte Dateitypen (z.B. `pdf, xlsx`) und optional ohne Signatur-/Inline-Bilder  
+✅ **Schnell bei großen Ordnern** – Absender/Betreff/Datum werden serverseitig (Outlook-DASL) vorgefiltert  
 ✅ **Zwei Export-Modi:**
   - **Anhänge**: Speichert alle Dateianhänge
   - **Body**: Exportiert E-Mail-Inhalte als .txt-Dateien  
