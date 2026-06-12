@@ -16,14 +16,21 @@ Architektur (angelehnt an die Geschwister-Tools pdftool / bilddownloader):
 - Einstellungen werden als JSON gemerkt
 """
 
+import csv
+import hashlib
 import json
 import logging
 import queue
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
-import win32com.client
+try:
+    import win32com.client
+except ImportError:  # nur unter Windows mit Outlook verfügbar
+    win32com = None
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
@@ -63,6 +70,18 @@ class ExportConfig:
     output_dir: str
 
 
+@dataclass
+class ExportRecord:
+    """Eine Zeile des Exportprotokolls (siehe CSV-Export)."""
+    received: str
+    sender: str
+    subject: str
+    kind: str       # "Anhang" | "Body"
+    filename: str
+    status: str     # "Gespeichert" | "Überschrieben" | "Übersprungen"
+    note: str = ""
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Hilfsfunktionen
 # ──────────────────────────────────────────────────────────────────────────────
@@ -70,6 +89,37 @@ def safe_filename(name: str) -> str:
     """Erzeugt einen sicheren Dateinamen (alphanumerisch + ``  ._-``)."""
     cleaned = "".join(c for c in str(name) if c.isalnum() or c in " ._-").strip()
     return cleaned or "unbenannt"
+
+
+def file_hash(path: Path, chunk: int = 65536) -> str:
+    """SHA-256-Hash einer Datei (erste 2 MB genügen für Duplikaterkennung)."""
+    h = hashlib.sha256()
+    read = 0
+    max_bytes = 2 * 1024 * 1024
+    try:
+        with open(path, "rb") as f:
+            while read < max_bytes:
+                buf = f.read(min(chunk, max_bytes - read))
+                if not buf:
+                    break
+                h.update(buf)
+                read += len(buf)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def write_export_csv(records: list, out_dir: Path) -> Path:
+    """Schreibt das Exportprotokoll als CSV (``;`` getrennt, Excel-tauglich)."""
+    csv_path = out_dir / f"_export_protokoll_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f, delimiter=";")
+        writer.writerow(["Empfangen", "Absender", "Betreff", "Typ",
+                         "Dateiname", "Status", "Hinweis"])
+        for r in records:
+            writer.writerow([r.received, r.sender, r.subject, r.kind,
+                             r.filename, r.status, r.note])
+    return csv_path
 
 
 def load_settings() -> dict:
@@ -134,6 +184,7 @@ class ExportWorker(threading.Thread):
         self.config = config
         self.q = msg_queue
         self.stop_event = stop_event
+        self.records: list = []
 
     def run(self) -> None:
         try:
@@ -163,7 +214,12 @@ class ExportWorker(threading.Thread):
 
         out_dir = Path(self.config.output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        return self._process_folder(target_folder, self.config.include_subfolders, out_dir)
+        count = self._process_folder(target_folder, self.config.include_subfolders, out_dir)
+
+        if self.records:
+            csv_path = write_export_csv(self.records, out_dir)
+            log.info("🧾 Protokoll geschrieben: %s", csv_path.name)
+        return count
 
     def _process_folder(self, folder, include_subfolders: bool, out_dir: Path) -> int:
         count = 0
@@ -204,27 +260,52 @@ class ExportWorker(threading.Thread):
             log.error("Fehler in %s: %s", folder.Name, e)
             return count
 
+    def _record(self, mail, kind, filename, status, note=""):
+        self.records.append(ExportRecord(
+            received=mail.ReceivedTime.strftime("%Y-%m-%d %H:%M"),
+            sender=str(mail.SenderEmailAddress),
+            subject=str(mail.Subject),
+            kind=kind, filename=filename, status=status, note=note,
+        ))
+
     def _save_attachments(self, mail, out_dir: Path) -> int:
         saved = 0
         for attachment in mail.Attachments:
             safe_name = safe_filename(attachment.FileName)
             target_path = out_dir / safe_name
 
-            # Konfliktauflösung: bei gleichem Namen gewinnt die neuere Version
-            if target_path.exists():
-                existing_mtime = target_path.stat().st_mtime
-                try:
-                    att_mtime = attachment.LastModifiedTime.timestamp()
-                except AttributeError:
-                    att_mtime = mail.ReceivedTime.timestamp()
+            if not target_path.exists():
+                attachment.SaveAsFile(str(target_path))
+                log.info("   ✅ Gespeichert: %s", safe_name)
+                self._record(mail, "Anhang", safe_name, "Gespeichert")
+                saved += 1
+                continue
 
-                if att_mtime <= existing_mtime:
-                    log.info("   ⏭️  Übersprungen (ältere Version): %s", safe_name)
-                    continue
-                log.info("   🔄 Überschrieben (neuere Version): %s", safe_name)
+            # Konflikt: erst per Inhalts-Hash auf echtes Duplikat prüfen,
+            # dann (bei abweichendem Inhalt) gewinnt die neuere Version.
+            tmp_path = out_dir / (safe_name + ".tmp_export")
+            attachment.SaveAsFile(str(tmp_path))
+            if file_hash(tmp_path) == file_hash(target_path):
+                tmp_path.unlink(missing_ok=True)
+                log.info("   ⏭️  Übersprungen (identisch): %s", safe_name)
+                self._record(mail, "Anhang", safe_name, "Übersprungen", "identischer Inhalt")
+                continue
 
-            attachment.SaveAsFile(str(target_path))
-            log.info("   ✅ Gespeichert: %s", safe_name)
+            existing_mtime = target_path.stat().st_mtime
+            try:
+                att_mtime = attachment.LastModifiedTime.timestamp()
+            except AttributeError:
+                att_mtime = mail.ReceivedTime.timestamp()
+
+            if att_mtime <= existing_mtime:
+                tmp_path.unlink(missing_ok=True)
+                log.info("   ⏭️  Übersprungen (ältere Version): %s", safe_name)
+                self._record(mail, "Anhang", safe_name, "Übersprungen", "ältere Version")
+                continue
+
+            tmp_path.replace(target_path)
+            log.info("   🔄 Überschrieben (neuere Version): %s", safe_name)
+            self._record(mail, "Anhang", safe_name, "Überschrieben", "neuere Version")
             saved += 1
         return saved
 
@@ -241,6 +322,7 @@ class ExportWorker(threading.Thread):
             encoding="utf-8",
         )
         log.info("   📄 Body gespeichert: %s", filename)
+        self._record(mail, "Body", filename, "Gespeichert")
         return 1
 
 

@@ -10,14 +10,27 @@
 ✅ **Zwei Export-Modi:**
   - **Anhänge**: Speichert alle Dateianhänge
   - **Body**: Exportiert E-Mail-Inhalte als .txt-Dateien  
-✅ **Intelligente Konfliktauflösung** – Bei gleichnamigen Anhängen gewinnt die neuere Version  
-✅ **Detailliertes Logging** – Fortschritt und Status in Echtzeit  
+✅ **Intelligente Konfliktauflösung** – Identische Anhänge (per Inhalts-Hash) werden übersprungen, bei echten Unterschieden gewinnt die neuere Version  
+✅ **Abbrechen-Button** – Laufende Exporte lassen sich jederzeit stoppen  
+✅ **CSV-Exportprotokoll** – Jeder Lauf schreibt `_export_protokoll_*.csv` mit allen verarbeiteten Elementen  
+✅ **Einstellungen gemerkt** – Ordner, Filter und Zielverzeichnis werden für den nächsten Start gespeichert  
+✅ **Detailliertes Logging** – Thread-sicher, Fortschritt und Status in Echtzeit  
 
 ## Systemvoraussetzungen
 
 - **Windows** mit **Outlook 2010+** (muss laufen während des Exports)
-- **Python 3.6+**
+- **Python 3.10+**
 - `pywin32` Paket
+
+## Entwicklung & Tests
+
+Die GUI-unabhängige Logik (Dateinamen, Hashing, CSV-Protokoll, Ordnersuche)
+ist mit `pytest` abgedeckt und läuft ohne Windows/Outlook:
+
+```bash
+pip install pytest
+pytest
+```
 
 ## Installation
 
