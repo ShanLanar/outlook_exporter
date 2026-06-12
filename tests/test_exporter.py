@@ -2,15 +2,11 @@
 
 Ausführen:  pytest    (benötigt weder Windows noch Outlook)
 """
-import sys
 from datetime import datetime
-from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import outlook_advanced_exporter as ox  # noqa: E402
+import outlook_advanced_exporter as ox
 
 
 # ── safe_filename ─────────────────────────────────────────────────────────────
@@ -181,6 +177,55 @@ def test_find_folder_by_path_root():
 def test_find_folder_by_path_missing():
     root, _ = _tree()
     assert ox.find_folder_by_path(root, "Postfach\\GibtsNicht") is None
+
+
+# ── RunLock ───────────────────────────────────────────────────────────────────
+def test_runlock_acquire_release(tmp_path):
+    lock = ox.RunLock(tmp_path)
+    assert lock.acquire() is True
+    assert lock.path.exists()
+    lock.release()
+    assert not lock.path.exists()
+
+
+def test_runlock_blocks_when_running(tmp_path):
+    first = ox.RunLock(tmp_path)
+    with first:                      # hält die Sperre (eigene, laufende PID)
+        second = ox.RunLock(tmp_path)
+        assert second.acquire() is False
+    # nach Freigabe wieder möglich
+    third = ox.RunLock(tmp_path)
+    assert third.acquire() is True
+    third.release()
+
+
+def test_runlock_overwrites_stale(tmp_path):
+    # Lock-Datei mit nicht existierender PID = verwaist -> überschreibbar
+    (tmp_path / "outlook_exporter.lock").write_text("999999\n2020-01-01\n", encoding="utf-8")
+    lock = ox.RunLock(tmp_path)
+    assert lock.acquire() is True
+    lock.release()
+
+
+# ── config_from_settings ──────────────────────────────────────────────────────
+def test_config_from_settings_maps_folder():
+    cfg = ox.config_from_settings({
+        "folder": "Postfach\\Posteingang",
+        "output_dir": "/tmp/out",
+        "export_type": "msg",
+        "skip_marked": True,
+        "unbekannt": "ignoriert",   # unbekannte Keys werden verworfen
+    })
+    assert cfg.folder_path == "Postfach\\Posteingang"
+    assert cfg.output_dir == "/tmp/out"
+    assert cfg.export_type == "msg"
+    assert cfg.skip_marked is True
+
+
+def test_config_from_settings_empty():
+    cfg = ox.config_from_settings({})
+    assert cfg.folder_path == ""
+    assert cfg.export_type == "attachments"
 
 
 # ── ExportConfig ──────────────────────────────────────────────────────────────

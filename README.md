@@ -41,6 +41,27 @@ Das Skript installiert `pywin32` + `pyinstaller` und baut über
 Konsolenfenster). Diese kann einfach kopiert und per Doppelklick gestartet
 werden – Outlook muss laufen.
 
+## Unbeaufsichtigt / geplant (CLI)
+
+Der Export lässt sich auch ohne GUI starten – er nutzt dann die zuletzt
+gespeicherten Einstellungen:
+
+```bat
+python outlook_advanced_exporter.py --run
+```
+
+Einen **täglichen** Lauf richtet man per Knopf „⏰ Täglich…" in der GUI ein
+oder über die Kommandozeile (Windows Task Scheduler):
+
+```bat
+python outlook_advanced_exporter.py --schedule 06:30
+python outlook_advanced_exporter.py --unschedule
+```
+
+Ein **Einzelinstanz-Schutz** (Lock-Datei) verhindert, dass sich zwei Läufe
+überschneiden; Mails, die einen Fehler verursachen, landen als eigene
+`Fehler`-Zeile im CSV-Protokoll, statt den Lauf abzubrechen.
+
 ## Entwicklung & Tests
 
 Die GUI-unabhängige Logik (Dateinamen, Hashing, CSV-Protokoll, Ordnersuche)

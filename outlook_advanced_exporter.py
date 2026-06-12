@@ -20,10 +20,12 @@ import csv
 import hashlib
 import json
 import logging
+import os
 import queue
+import subprocess
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime
 from pathlib import Path
 
@@ -33,7 +35,7 @@ except ImportError:  # nur unter Windows mit Outlook verfügbar
     win32com = None
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging – alle Records laufen über die Queue und werden im Main-Thread
@@ -69,13 +71,13 @@ SETTINGS_PATH = app_base_dir() / "outlook_exporter_settings.json"
 # ──────────────────────────────────────────────────────────────────────────────
 @dataclass
 class ExportConfig:
-    folder_path: str
-    include_subfolders: bool
-    filter_sender: str
-    filter_subject: str
-    filter_body: str
-    export_type: str  # "attachments" | "body" | "msg"
-    output_dir: str
+    folder_path: str = ""
+    include_subfolders: bool = True
+    filter_sender: str = ""
+    filter_subject: str = ""
+    filter_body: str = ""
+    export_type: str = "attachments"  # "attachments" | "body" | "msg"
+    output_dir: str = ""
     filter_date_from: str = ""     # "TT.MM.JJJJ" oder "JJJJ-MM-TT"
     filter_date_to: str = ""
     filter_extensions: str = ""    # z.B. "pdf, xlsx" (leer = alle)
@@ -246,6 +248,105 @@ def save_settings(data: dict) -> None:
         log.warning("Einstellungen konnten nicht gespeichert werden: %s", e)
 
 
+def config_from_settings(s: dict) -> "ExportConfig":
+    """Baut eine ``ExportConfig`` aus dem gespeicherten Settings-Dict (für CLI).
+    Übernimmt alle bekannten Felder; ``folder`` wird auf ``folder_path`` gemappt."""
+    s = s or {}
+    valid = {f.name for f in fields(ExportConfig)}
+    data = {k: v for k, v in s.items() if k in valid}
+    data.setdefault("folder_path", s.get("folder", ""))
+    return ExportConfig(**data)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Einzelinstanz-Schutz (übernommen aus bmecat-tool/lib/run_lock.py)
+# ──────────────────────────────────────────────────────────────────────────────
+class RunLockError(RuntimeError):
+    """Wird geworfen, wenn bereits eine Instanz läuft."""
+
+
+def _pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+class RunLock:
+    """Context-Manager, der per Lock-Datei (PID) einen zweiten parallelen Lauf
+    verhindert. Verwaiste Locks (Absturz) werden überschrieben."""
+
+    def __init__(self, base_dir: Path):
+        self.path = Path(base_dir) / "outlook_exporter.lock"
+        self._owned = False
+
+    def acquire(self) -> bool:
+        if self.path.exists():
+            try:
+                old_pid = int(self.path.read_text(encoding="utf-8").splitlines()[0])
+            except (OSError, ValueError, IndexError):
+                old_pid = 0
+            if _pid_running(old_pid):
+                return False  # andere Instanz aktiv
+        try:
+            self.path.write_text(f"{os.getpid()}\n{datetime.now():%Y-%m-%d %H:%M:%S}\n",
+                                 encoding="utf-8")
+            self._owned = True
+        except OSError as e:
+            log.warning("Lock-Datei konnte nicht erstellt werden: %s", e)
+        return True
+
+    def release(self) -> None:
+        if self._owned:
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._owned = False
+
+    def __enter__(self):
+        if not self.acquire():
+            raise RunLockError("Es läuft bereits ein Export (andere Instanz).")
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Geplanter Lauf via Windows Task Scheduler (angelehnt an bmecat scheduler.py)
+# ──────────────────────────────────────────────────────────────────────────────
+_TASK_NAME = "OutlookExporterDaily"
+
+
+def _self_command() -> str:
+    """Befehl, der diesen Exporter im --run-Modus startet (Skript oder .exe)."""
+    exe = sys.executable
+    if getattr(sys, "frozen", False):
+        return f'"{exe}" --run'
+    return f'"{exe}" "{Path(__file__).resolve()}" --run'
+
+
+def schedule_daily(hour: int, minute: int) -> None:
+    """Richtet einen täglichen Windows-Task ein (überschreibt vorhandenen)."""
+    subprocess.run(
+        ["schtasks", "/Create", "/SC", "DAILY", "/TN", _TASK_NAME,
+         "/TR", _self_command(), "/ST", f"{hour:02d}:{minute:02d}", "/F"],
+        check=True,
+    )
+
+
+def unschedule() -> None:
+    subprocess.run(["schtasks", "/Delete", "/TN", _TASK_NAME, "/F"], check=True)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Outlook-Zugriff (GUI-unabhängig)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -304,11 +405,14 @@ class ExportWorker(threading.Thread):
 
     def run(self) -> None:
         try:
-            count = self._export()
+            with RunLock(app_base_dir()):
+                count = self._export()
             if self.stop_event.is_set():
                 self.q.put(("cancelled", count))
             else:
                 self.q.put(("done", count))
+        except RunLockError as e:
+            self.q.put(("error", str(e)))
         except Exception as e:  # noqa: BLE001 – an die GUI weiterreichen
             self.q.put(("error", str(e)))
 
@@ -347,7 +451,7 @@ class ExportWorker(threading.Thread):
             if self.stop_event.is_set():
                 break
             self._tick()
-            count += self._process_mail(mail, out_dir)
+            count += self._safe_process(mail, out_dir)
         return count
 
     def _export_folder(self, app, out_dir: Path) -> int:
@@ -403,7 +507,7 @@ class ExportWorker(threading.Thread):
                 if self.stop_event.is_set():
                     return count
                 self._tick()
-                count += self._process_mail(mail, out_dir)
+                count += self._safe_process(mail, out_dir)
 
             if include_subfolders:
                 for sub in folder.Folders:
@@ -415,6 +519,29 @@ class ExportWorker(threading.Thread):
         except Exception as e:  # noqa: BLE001
             log.error("Fehler in %s: %s", folder.Name, e)
             return count
+
+    def _safe_process(self, mail, out_dir: Path) -> int:
+        """Wrappt _process_mail: eine einzelne fehlerhafte Mail bricht den Lauf
+        nicht ab, sondern landet als Fehlerzeile im Protokoll (Dead Letter)."""
+        try:
+            return self._process_mail(mail, out_dir)
+        except Exception as e:  # noqa: BLE001
+            self._record_failure(mail, str(e))
+            return 0
+
+    def _record_failure(self, mail, error: str) -> None:
+        def _safe(getter, default="—"):
+            try:
+                return getter()
+            except Exception:  # noqa: BLE001
+                return default
+        log.error("❌ Mail übersprungen (Fehler): %s", error)
+        self.records.append(ExportRecord(
+            received=_safe(lambda: mail.ReceivedTime.strftime("%Y-%m-%d %H:%M")),
+            sender=_safe(lambda: str(mail.SenderEmailAddress)),
+            subject=_safe(lambda: str(mail.Subject)),
+            kind="—", filename="—", status="Fehler", note=error,
+        ))
 
     def _process_mail(self, mail, out_dir: Path) -> int:
         """Filtert eine einzelne Mail und exportiert sie je nach Typ. Gibt die
@@ -701,6 +828,30 @@ class App(tk.Tk):
         self.btn_stop = ttk.Button(btn_frame, text="⏹ Abbrechen",
                                    command=self._on_stop, state=tk.DISABLED)
         self.btn_stop.pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="⏰ Täglich…",
+                   command=self._on_schedule).pack(side=tk.LEFT, padx=5)
+
+    def _on_schedule(self) -> None:
+        """Richtet einen täglichen Windows-Task ein (oder entfernt ihn)."""
+        self._save_settings()
+        answer = simpledialog.askstring(
+            "Täglicher Export",
+            "Uhrzeit HH:MM für den täglichen Export\n(leer lassen = geplanten Lauf entfernen):",
+            parent=self)
+        if answer is None:
+            return
+        try:
+            if answer.strip():
+                hour, minute = answer.strip().split(":")
+                schedule_daily(int(hour), int(minute))
+                messagebox.showinfo(
+                    "Geplant", f"Täglicher Export um {answer.strip()} eingerichtet.\n"
+                    "Er nutzt die aktuell gespeicherten Einstellungen.")
+            else:
+                unschedule()
+                messagebox.showinfo("Entfernt", "Geplanter täglicher Export entfernt.")
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("Fehler", f"Aufgabe konnte nicht geändert werden:\n{e}")
 
     def _update_source_state(self) -> None:
         """Aktiviert/deaktiviert ordnerbezogene Felder je nach Quelle."""
@@ -874,7 +1025,60 @@ class App(tk.Tk):
         self.destroy()
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Headless-/CLI-Lauf (für geplante, unbeaufsichtigte Exporte)
+# ──────────────────────────────────────────────────────────────────────────────
+def run_cli(config: ExportConfig) -> int:
+    """Führt einen Export ohne GUI aus (Logs auf die Konsole). Rückgabe = Exitcode."""
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", "%H:%M:%S"))
+    log.handlers.clear()
+    log.addHandler(handler)
+
+    if not config.output_dir:
+        log.error("Kein Ausgabeverzeichnis in den Einstellungen – Abbruch.")
+        return 2
+
+    msg_queue: "queue.Queue" = queue.Queue()
+    worker = ExportWorker(config, msg_queue, threading.Event())
+    worker.start()
+    worker.join()
+
+    code = 0
+    while not msg_queue.empty():
+        kind, payload = msg_queue.get()
+        if kind == "error":
+            log.error("Fehler: %s", payload)
+            code = 1
+        elif kind == "done":
+            log.info("✨ Fertig: %s Elemente exportiert.", payload)
+    return code
+
+
 def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="Outlook Advanced Exporter")
+    parser.add_argument("--run", action="store_true",
+                        help="Headless-Export mit den gespeicherten Einstellungen")
+    parser.add_argument("--schedule", metavar="HH:MM",
+                        help="Täglichen Windows-Task für --run einrichten")
+    parser.add_argument("--unschedule", action="store_true",
+                        help="Geplanten täglichen Task wieder entfernen")
+    args = parser.parse_args()
+
+    if args.run:
+        sys.exit(run_cli(config_from_settings(load_settings())))
+    if args.schedule:
+        hour, minute = args.schedule.split(":")
+        schedule_daily(int(hour), int(minute))
+        print(f"Täglicher Export um {args.schedule} eingerichtet "
+              "(nutzt die gespeicherten Einstellungen).")
+        return
+    if args.unschedule:
+        unschedule()
+        print("Geplanter täglicher Export entfernt.")
+        return
+
     App().mainloop()
 
 
