@@ -21,6 +21,7 @@ import hashlib
 import json
 import logging
 import queue
+import sys
 import threading
 from dataclasses import dataclass
 from datetime import datetime
@@ -50,10 +51,17 @@ class QueueLogHandler(logging.Handler):
         self.q = msg_queue
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.q.put(("log", self.format(record)))
+        self.q.put(("log", (self.format(record), record.levelname)))
 
 
-SETTINGS_PATH = Path.home() / ".outlook_exporter.json"
+def app_base_dir() -> Path:
+    """Basisverzeichnis: Ordner der ``.exe`` (PyInstaller) bzw. des Skripts."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+SETTINGS_PATH = app_base_dir() / "outlook_exporter_settings.json"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -89,6 +97,11 @@ def safe_filename(name: str) -> str:
     """Erzeugt einen sicheren Dateinamen (alphanumerisch + ``  ._-``)."""
     cleaned = "".join(c for c in str(name) if c.isalnum() or c in " ._-").strip()
     return cleaned or "unbenannt"
+
+
+def filter_matches(needle: str, haystack) -> bool:
+    """True, wenn der Filter leer ist oder als Teilstring (case-insensitiv) passt."""
+    return not needle or needle.lower() in str(haystack).lower()
 
 
 def file_hash(path: Path, chunk: int = 65536) -> str:
@@ -234,12 +247,12 @@ class ExportWorker(threading.Thread):
                 if mail.Class != 43:  # nur E-Mails
                     continue
 
-                # Filter anwenden
-                if cfg.filter_sender and cfg.filter_sender.lower() not in str(mail.SenderEmailAddress).lower():
+                # Filter anwenden (Teilstring, case-insensitive)
+                if not filter_matches(cfg.filter_sender, mail.SenderEmailAddress):
                     continue
-                if cfg.filter_subject and cfg.filter_subject.lower() not in str(mail.Subject).lower():
+                if not filter_matches(cfg.filter_subject, mail.Subject):
                     continue
-                if cfg.filter_body and cfg.filter_body.lower() not in str(mail.Body).lower():
+                if not filter_matches(cfg.filter_body, mail.Body):
                     continue
 
                 log.info("📧 %s - %s",
@@ -408,7 +421,13 @@ class App(tk.Tk):
         # 6. Log
         ttk.Label(mainframe, text="Log:").grid(column=0, row=9, sticky=tk.W, pady=5)
         self.log_widget = scrolledtext.ScrolledText(mainframe, height=18, state=tk.NORMAL)
-        self.log_widget.grid(column=0, row=10, columnspan=2, sticky=(tk.N, tk.S, tk.E, tk.W), pady=5)
+        self.log_widget.grid(column=0, row=10, columnspan=2,
+                             sticky=(tk.N, tk.S, tk.E, tk.W), pady=5)
+        # Farbliche Kategorien für die Log-Ausgabe
+        self.log_widget.tag_config("error", foreground="#c0392b")
+        self.log_widget.tag_config("warning", foreground="#d35400")
+        self.log_widget.tag_config("success", foreground="#1e8449")
+        self.log_widget.tag_config("muted", foreground="#7f8c8d")
         self.progress_label = ttk.Label(mainframe, text="Bereit.")
         self.progress_label.grid(column=0, row=11, sticky=tk.W, pady=5)
 
@@ -479,7 +498,8 @@ class App(tk.Tk):
             while True:
                 kind, payload = self.queue.get_nowait()
                 if kind == "log":
-                    self._append_log(payload)
+                    msg, level = payload
+                    self._append_log(msg, level)
                 elif kind == "done":
                     self._finish(f"✨ Fertig! {payload} Elemente exportiert.",
                                  "Erfolg", f"Export beendet.\n{payload} Elemente gespeichert.")
@@ -493,8 +513,18 @@ class App(tk.Tk):
             pass
         self.after(100, self._drain_queue)
 
-    def _append_log(self, text: str) -> None:
-        self.log_widget.insert(tk.END, text + "\n")
+    _TAG_BY_LEVEL = {"ERROR": "error", "CRITICAL": "error", "WARNING": "warning"}
+    _SUCCESS_MARKERS = ("✅", "✨", "🔄", "🧾", "📄")
+
+    def _append_log(self, text: str, level: str = "INFO") -> None:
+        tag = self._TAG_BY_LEVEL.get(level, "")
+        if not tag:
+            stripped = text.lstrip()
+            if stripped.startswith(self._SUCCESS_MARKERS):
+                tag = "success"
+            elif stripped.startswith("⏭"):
+                tag = "muted"
+        self.log_widget.insert(tk.END, text + "\n", tag or ())
         self.log_widget.see(tk.END)
 
     def _finish(self, status: str, title, message, error: bool = False) -> None:

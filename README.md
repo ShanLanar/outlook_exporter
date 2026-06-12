@@ -22,6 +22,20 @@
 - **Python 3.10+**
 - `pywin32` Paket
 
+## Standalone-.exe bauen (kein Python auf dem Zielrechner nötig)
+
+Für die Weitergabe an Kolleg:innen ohne Python-Installation lässt sich eine
+einzelne `.exe` erzeugen:
+
+```bat
+build.bat
+```
+
+Das Skript installiert `pywin32` + `pyinstaller` und baut über
+`OutlookExporter.spec` die Datei **`dist\OutlookExporter.exe`** (ohne
+Konsolenfenster). Diese kann einfach kopiert und per Doppelklick gestartet
+werden – Outlook muss laufen.
+
 ## Entwicklung & Tests
 
 Die GUI-unabhängige Logik (Dateinamen, Hashing, CSV-Protokoll, Ordnersuche)

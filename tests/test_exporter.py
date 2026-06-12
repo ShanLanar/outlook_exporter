@@ -28,6 +28,18 @@ def test_safe_filename_handles_non_str():
     assert ox.safe_filename(12345) == "12345"
 
 
+# ── filter_matches ────────────────────────────────────────────────────────────
+@pytest.mark.parametrize("needle, haystack, expected", [
+    ("", "egal", True),                       # leerer Filter passt immer
+    ("@firma.de", "max@firma.de", True),       # Teilstring
+    ("RECHNUNG", "Monatsrechnung", True),      # case-insensitiv
+    ("xyz", "abc", False),
+    ("123", 12345, True),                       # nicht-String haystack
+])
+def test_filter_matches(needle, haystack, expected):
+    assert ox.filter_matches(needle, haystack) is expected
+
+
 # ── file_hash ─────────────────────────────────────────────────────────────────
 def test_file_hash_identical_content(tmp_path):
     a = tmp_path / "a.bin"

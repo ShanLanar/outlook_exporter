@@ -8,6 +8,12 @@ env/
 
 # Laufzeit / Einstellungen
 .outlook_exporter.json
+outlook_exporter_settings.json
+
+# PyInstaller-Build
+build/
+dist/
+*.manifest
 
 # IDE / OS
 .idea/
