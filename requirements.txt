@@ -1,1 +1,8 @@
-pywin32
+# Outlook Advanced Exporter – Python-Abhängigkeiten
+# Installation: pip install -r requirements.txt
+
+pywin32>=306   # COM-Zugriff auf Outlook (nur Windows)
+
+# Systemvoraussetzungen:
+#   - Windows mit installiertem Outlook 2010+ (muss während des Exports laufen)
+#   - Python 3.10+ (tkinter ist Teil der Standard-Installation)
