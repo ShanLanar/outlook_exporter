@@ -81,6 +81,7 @@ class ExportConfig:
     filter_date_from: str = ""     # "TT.MM.JJJJ" oder "JJJJ-MM-TT"
     filter_date_to: str = ""
     filter_extensions: str = ""    # z.B. "pdf, xlsx" (leer = alle)
+    filter_category: str = ""      # Outlook-Kategorie(n), kommagetrennt = beliebige passt
     skip_inline_images: bool = True
     source: str = "folder"          # "folder" | "selection" (aktuelle Outlook-Auswahl)
     mirror_structure: bool = False  # Quell-Ordnerstruktur im Zielordner nachbauen
@@ -184,6 +185,15 @@ def has_category(categories, name: str) -> bool:
         return False
     parts = [c.strip().lower() for c in str(categories or "").split(",")]
     return name.strip().lower() in parts
+
+
+def category_filter_matches(categories, wanted_raw: str) -> bool:
+    """True, wenn kein Kategoriefilter gesetzt ist oder die Mail mindestens eine
+    der gewünschten Kategorien trägt (kommagetrennte Liste = ODER-Verknüpfung)."""
+    wanted = [w.strip() for w in (wanted_raw or "").split(",") if w.strip()]
+    if not wanted:
+        return True
+    return any(has_category(categories, w) for w in wanted)
 
 
 def add_category(mail, name: str) -> None:
@@ -368,6 +378,16 @@ def get_all_outlook_folders() -> list:
     for store in outlook.Folders:  # Postfach, Archiv usw.
         traverse(store)
     return folders
+
+
+def get_outlook_categories() -> list:
+    """Liest die in Outlook angelegten Master-Kategorien (für das Dropdown).
+    Gibt bei Fehlern eine leere Liste zurück (dann freie Texteingabe)."""
+    try:
+        ns = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+        return [c.Name for c in ns.Categories]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def find_folder_by_path(folder, path):
@@ -560,6 +580,8 @@ class ExportWorker(threading.Thread):
             rt = datetime.fromtimestamp(mail.ReceivedTime.timestamp())
             if not date_in_range(rt, self._dt_from, self._dt_to):
                 return 0
+        if not category_filter_matches(mail.Categories, cfg.filter_category):
+            return 0
         if cfg.skip_marked and has_category(mail.Categories, cfg.category_name):
             return 0
 
@@ -692,6 +714,7 @@ class App(tk.Tk):
         self.settings = load_settings()
         self._build_ui()
         self._load_folders()
+        self._load_categories()
         self._apply_settings()
         self.after(100, self._drain_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -754,9 +777,13 @@ class App(tk.Tk):
             column=0, row=5, sticky=tk.W)
         self.ext_entry = ttk.Entry(filter_frame, width=40)
         self.ext_entry.grid(column=1, row=5, sticky=tk.W, padx=5)
+        ttk.Label(filter_frame, text="Outlook-Kategorie:").grid(column=0, row=6, sticky=tk.W)
+        self.category_var = tk.StringVar()
+        self.category_combo = ttk.Combobox(filter_frame, textvariable=self.category_var, width=37)
+        self.category_combo.grid(column=1, row=6, sticky=tk.W, padx=5)
         self.skip_inline_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(filter_frame, text="Signatur-/Inline-Bilder überspringen",
-                        variable=self.skip_inline_var).grid(column=0, row=6, columnspan=2,
+                        variable=self.skip_inline_var).grid(column=0, row=7, columnspan=2,
                                                              sticky=tk.W, pady=(4, 0))
 
         # Export-Typ
@@ -875,6 +902,11 @@ class App(tk.Tk):
             self.folder_combo.current(names.index(current) if current in names else 0)
         log.info("🔄 Ordnerliste geladen (%d Ordner).", len(names))
 
+    def _load_categories(self) -> None:
+        """Füllt das Kategorie-Dropdown mit den in Outlook angelegten Kategorien
+        (Freitext bleibt möglich)."""
+        self.category_combo["values"] = get_outlook_categories()
+
     def _select_output(self) -> None:
         d = filedialog.askdirectory()
         if d:
@@ -909,6 +941,7 @@ class App(tk.Tk):
             filter_date_from=self.date_from_entry.get(),
             filter_date_to=self.date_to_entry.get(),
             filter_extensions=self.ext_entry.get(),
+            filter_category=self.category_var.get(),
             skip_inline_images=self.skip_inline_var.get(),
             source=source,
             mirror_structure=self.mirror_var.get(),
@@ -993,6 +1026,7 @@ class App(tk.Tk):
         self.date_from_entry.insert(0, s.get("filter_date_from", ""))
         self.date_to_entry.insert(0, s.get("filter_date_to", ""))
         self.ext_entry.insert(0, s.get("filter_extensions", ""))
+        self.category_var.set(s.get("filter_category", ""))
         self.skip_inline_var.set(s.get("skip_inline_images", True))
         self.source_var.set(s.get("source", "folder"))
         self.mirror_var.set(s.get("mirror_structure", False))
@@ -1012,6 +1046,7 @@ class App(tk.Tk):
             "filter_date_from": self.date_from_entry.get(),
             "filter_date_to": self.date_to_entry.get(),
             "filter_extensions": self.ext_entry.get(),
+            "filter_category": self.category_var.get(),
             "skip_inline_images": self.skip_inline_var.get(),
             "source": self.source_var.get(),
             "mirror_structure": self.mirror_var.get(),

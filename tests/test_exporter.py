@@ -111,6 +111,20 @@ def test_has_category(categories, name, expected):
     assert ox.has_category(categories, name) is expected
 
 
+# ── category_filter_matches ───────────────────────────────────────────────────
+@pytest.mark.parametrize("categories, wanted, expected", [
+    ("Rechnung", "", True),                       # kein Filter ⇒ alles
+    ("Rechnung, Wichtig", "Rechnung", True),
+    ("Rechnung", "rechnung", True),                # case-insensitiv
+    ("Wichtig", "Rechnung", False),
+    ("Steuer", "Rechnung, Steuer", True),          # ODER-Liste
+    ("", "Rechnung", False),
+    (None, "Rechnung", False),
+])
+def test_category_filter_matches(categories, wanted, expected):
+    assert ox.category_filter_matches(categories, wanted) is expected
+
+
 # ── file_hash ─────────────────────────────────────────────────────────────────
 def test_file_hash_identical_content(tmp_path):
     a = tmp_path / "a.bin"

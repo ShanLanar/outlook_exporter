@@ -6,7 +6,8 @@
 
 ✅ **Zwei Quellen** – Ganzer **Ordner** (inkl. Unterordner) **oder die aktuell in Outlook markierten Mails**  
 ✅ **Ordner-Dropdown** – Alle Outlook-Ordner (inkl. Pfade) in einer Auswahlliste  
-✅ **Multi-Filter** – Nach Absender, Betreff, Text **und Empfangsdatum (von/bis)** gleichzeitig filtern  
+✅ **Multi-Filter** – Nach Absender, Betreff, Text, Empfangsdatum (von/bis) **und Outlook-Kategorie** gleichzeitig filtern  
+✅ **Outlook-Integration** – In Outlook vergebene Kategorien dienen als Filter (in Outlook taggen → gezielt exportieren); das Dropdown zeigt die vorhandenen Kategorien  
 ✅ **Anhang-Filter** – Nur bestimmte Dateitypen (z.B. `pdf, xlsx`) und optional ohne Signatur-/Inline-Bilder  
 ✅ **Schnell bei großen Ordnern** – Absender/Betreff/Datum werden serverseitig (Outlook-DASL) vorgefiltert  
 ✅ **Drei Export-Modi:**
